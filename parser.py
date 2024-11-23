@@ -1,87 +1,307 @@
+import json
+from opensearchpy import OpenSearch, helpers
 from pyparsing import (
-    Word, alphas, alphanums, nums, oneOf, infixNotation, opAssoc, Optional, Keyword
+    Word, alphas, alphanums, nums, oneOf, opAssoc, infixNotation,
+    Keyword, Literal, CaselessKeyword, Group, ParserElement, quotedString,
+    removeQuotes, Regex
 )
 
-# Define basic elements
-identifier = Word(alphas + "_", alphanums + "_")
-number = Word(nums).setParseAction(lambda t: int(t[0]))
-string = dblQuotedString.setParseAction(removeQuotes) | identifier
-comparison_op = oneOf("= != > >= < <=")
-logical_op = oneOf("AND OR")
-field_name = (
-    (oneOf("metrics params tags") + "." + identifier) |
-    oneOf("status user_id experiment_id run_id start_time end_time")
+# Enable packrat parsing for speed
+ParserElement.enablePackrat()
+
+# Initialize OpenSearch client
+client = OpenSearch(
+    hosts=[{'host': 'localhost', 'port': 9200}],
+    http_compress=True,
+    timeout=30,
+    max_retries=3,
+    retry_on_timeout=True
 )
-order_direction = oneOf("ASC DESC")
 
-# Define clauses
-condition = Group(field_name + comparison_op + (number | string))
-order_by_clause = Keyword("ORDER BY") + Group(field_name + Optional(order_direction, default="ASC"))
-limit_clause = Keyword("LIMIT") + number
+# Define comparison operators
+comparison_ops = oneOf("= != > >= < <= eq ne gt ge lt le", caseless=True)
 
-# Define the full grammar
-expression = infixNotation(
-    condition,
+# Define logical operators
+and_ = CaselessKeyword("and")
+or_ = CaselessKeyword("or")
+not_ = CaselessKeyword("not")
+
+# Define field types
+field_type = oneOf("metrics params tags attributes", caseless=True)
+
+# Define identifier (e.g., 'accuracy', 'optimizer')
+identifier = Word(alphas + "_", alphanums + "_.:")
+
+# Define numeric value
+number = Regex(r'\d+(\.\d*)?([eE][+-]?\d+)?').setParseAction(lambda t: float(t[0]))
+
+# Define string value
+string = quotedString.setParseAction(removeQuotes)
+
+# Define value (number or string)
+value = number | string
+
+# Define comparison expression
+comparison_expr = Group(
+    (field_type + Literal('.').suppress() + identifier)('field') +
+    comparison_ops('op') +
+    value('value')
+)
+
+# Define the full expression grammar
+bool_expr = infixNotation(
+    comparison_expr,
     [
-        (logical_op, 2, opAssoc.LEFT),
+        (not_, 1, opAssoc.RIGHT),
+        (and_, 2, opAssoc.LEFT),
+        (or_, 2, opAssoc.LEFT),
     ],
 )
-query = Group(expression) + Optional(order_by_clause) + Optional(limit_clause)
 
-def parse_filter_expression(expression_str):
+def parse_filter_expression(filter_expr):
     try:
-        parsed = query.parseString(expression_str, parseAll=True)
-        filter_ast = _build_ast(parsed[0])
-        order_by = _parse_order_by(parsed[1]) if len(parsed) > 1 and "ORDER BY" in parsed[1:] else None
-        limit = _parse_limit(parsed[-1]) if "LIMIT" in parsed else None
-        return {
-            "query": filter_ast.to_query(),
-            "sort": order_by,
-            "size": limit,
-        }
-    except Exception as e:
-        raise ValueError(f"Invalid filter expression: {expression_str}") from e
-
-def _build_ast(parsed_expr):
-    if isinstance(parsed_expr, ParseResults):
-        if len(parsed_expr) == 1:
-            return _build_ast(parsed_expr[0])
-        elif len(parsed_expr) == 3 and parsed_expr[1] in ["AND", "OR"]:
-            return LogicalOperation(parsed_expr)
-        else:
-            return Condition(parsed_expr)
-    else:
+        parsed_expr = bool_expr.parseString(filter_expr, parseAll=True)[0]
         return parsed_expr
+    except Exception as e:
+        raise ValueError(f"Error parsing filter expression: {e}")
 
-def _parse_order_by(order_clause):
-    field, direction = order_clause[1][0], order_clause[1][1]
-    return [{field: {"order": direction.lower()}}]
+def comparison_to_query(tokens):
+    field_info = tokens['field']
+    operator = tokens['op']
+    value = tokens['value']
 
-def _parse_limit(limit_clause):
-    return limit_clause[1]
+    # Extract field components
+    field_type = field_info[0].lower()
+    key = field_info[1]
+
+    path = field_type
+    key_field = f"{field_type}.key"
+    value_field = f"{field_type}.value"
+
+    # Map operators to OpenSearch equivalents
+    operator_map = {
+        '=': 'term',
+        'eq': 'term',
+        '!=': 'must_not',
+        'ne': 'must_not',
+        '>': 'gt',
+        'gt': 'gt',
+        '>=': 'gte',
+        'ge': 'gte',
+        '<': 'lt',
+        'lt': 'lt',
+        '<=': 'lte',
+        'le': 'lte'
+    }
+
+    if operator.lower() in ['=', 'eq']:
+        term_query = {
+            "nested": {
+                "path": path,
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "term": { key_field: key } },
+                            { "term": { value_field: value } }
+                        ]
+                    }
+                }
+            }
+        }
+        return term_query
+    elif operator.lower() in ['!=', 'ne']:
+        term_query = {
+            "nested": {
+                "path": path,
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "term": { key_field: key } },
+                            { "term": { value_field: value } }
+                        ]
+                    }
+                }
+            }
+        }
+        return {
+            "bool": {
+                "must_not": term_query
+            }
+        }
+    else:
+        # Range queries
+        range_op = operator_map[operator.lower()]
+        range_query = {
+            "nested": {
+                "path": path,
+                "query": {
+                    "bool": {
+                        "must": [
+                            { "term": { key_field: key } },
+                            { "range": { value_field: { range_op: value } } }
+                        ]
+                    }
+                }
+            }
+        }
+        return range_query
+
+def ast_to_query(ast):
+    if isinstance(ast, str):
+        # Should not reach here in correct parsing
+        return {}
+    elif isinstance(ast, list):
+        if len(ast) == 1:
+            return ast_to_query(ast[0])
+        elif len(ast) == 2:
+            # NOT expression
+            op, operand = ast
+            return {
+                "bool": {
+                    "must_not": [
+                        ast_to_query(operand)
+                    ]
+                }
+            }
+        elif len(ast) == 3:
+            # Binary expression
+            left, op, right = ast
+            if op.lower() == 'and':
+                return {
+                    "bool": {
+                        "must": [
+                            ast_to_query(left),
+                            ast_to_query(right)
+                        ]
+                    }
+                }
+            elif op.lower() == 'or':
+                return {
+                    "bool": {
+                        "should": [
+                            ast_to_query(left),
+                            ast_to_query(right)
+                        ],
+                        "minimum_should_match": 1
+                    }
+                }
+            else:
+                # Comparison expression
+                return comparison_to_query(ast)
+    else:
+        # Comparison expression
+        return comparison_to_query(ast)
+
+def build_sort(order_by):
+    """
+    Constructs the sort portion of the query.
+    """
+    sort_list = []
+    for clause in order_by:
+        parts = clause.strip().split()
+        if len(parts) != 2:
+            raise ValueError(f"Invalid order_by clause: '{clause}'")
+        field, direction = parts
+        if direction.upper() not in ['ASC', 'DESC']:
+            raise ValueError(f"Invalid sort direction in clause: '{clause}'")
+        
+        field_info = field.split('.')
+        if len(field_info) != 2:
+            raise ValueError(f"Invalid field in order_by clause: '{clause}'")
+        field_type, key = field_info
+        field_type = field_type.lower()
+        path = field_type
+        key_field = f"{field_type}.key"
+        value_field = f"{field_type}.value"
+
+        sort_clause = {
+            value_field: {
+                "order": direction.lower(),
+                "nested": {
+                    "path": path,
+                    "filter": {
+                        "term": { key_field: key }
+                    }
+                }
+            }
+        }
+        sort_list.append(sort_clause)
+    return sort_list
+
+def search_runs(request_body):
+    experiment_id = request_body.get('experiment_id')
+    if not experiment_id:
+        raise ValueError("experiment_id is required in the request body.")
     
-if __name__ == "__main__":
-    filter_expression = (
-        'metrics.accuracy >= 0.9 AND params.model = "resnet" ORDER BY metrics.accuracy DESC LIMIT 10'
+    filter_expr = request_body.get('filter', '')
+    max_results = request_body.get('max_results', 100)
+    order_by = request_body.get('order_by', [])
+    
+    query_body = {
+        "size": max_results,
+        "query": {
+            "bool": {
+                "must": []
+            }
+        }
+    }
+    
+    # Add experiment_id to the query
+    query_body['query']['bool']['must'].append({
+        "term": {
+            "experiment_id": experiment_id
+        }
+    })
+    
+    # Add filter to query
+    if filter_expr:
+        parsed_filter = parse_filter_expression(filter_expr)
+        filter_query = ast_to_query(parsed_filter)
+        query_body['query']['bool']['must'].append(filter_query)
+    
+    # Add sorting to query
+    if order_by:
+        sort_clause = build_sort(order_by)
+        query_body['sort'] = sort_clause
+    
+    # Execute the search query
+    response = client.search(
+        index="mlflow-runs",
+        body=query_body
     )
-    query = parse_filter_expression(filter_expression)
-    print("Filter Expression:")
-    print(filter_expression)
-    print("\nGenerated OpenSearch Query:")
-    print(json.dumps(query, indent=2))
     
-    test_expressions = [
-    'status = "FINISHED" ORDER BY start_time DESC LIMIT 5',
-    'metrics.loss < 0.05 ORDER BY metrics.loss ASC LIMIT 20',
-    'params.batch_size >= 32 AND params.learning_rate <= 0.01 LIMIT 50',
-    'user_id != "user123" AND start_time >= "2023-10-01T00:00:00Z" ORDER BY end_time DESC'
-]
+    # Process hits
+    runs = []
+    for hit in response['hits']['hits']:
+        source = hit['_source']
+        run = {
+            "run_id": source.get('run_id'),
+            "experiment_id": source.get('experiment_id'),
+            "user_id": source.get('user_id'),
+            "status": source.get('status'),
+            "start_time": source.get('start_time'),
+            "end_time": source.get('end_time'),
+            "metrics": {item['key']: item['value'] for item in source.get('metrics', [])},
+            "params": {item['key']: item['value'] for item in source.get('params', [])},
+            "tags": {item['key']: item['value'] for item in source.get('tags', [])}
+        }
+        runs.append(run)
+    
+    # Return the results
+    return {
+        "runs": runs,
+        "total": response['hits']['total']['value']
+    }
 
-for expr in test_expressions:
-    query = parse_filter_expression(expr)
-    print(f"Filter Expression: {expr}")
-    print("Generated OpenSearch Query:")
-    print(json.dumps(query, indent=2))
-    print("-" * 80)
+if __name__ == "__main__":
+    request_body = {
+        "experiment_id": "exp1",
+        "filter": "metrics.accuracy > 0.9",
+        "max_results": 100,
+        "order_by": ["metrics.accuracy DESC"]
+    }
+    result = search_runs(request_body)
+    print(json.dumps(result, indent=2))
     
+
     
