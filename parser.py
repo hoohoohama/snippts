@@ -18,6 +18,16 @@ client = OpenSearch(
     retry_on_timeout=True
 )
 
+# Define valid top-level fields
+VALID_TOP_LEVEL_FIELDS = {
+    'run_id',
+    'experiment_id',
+    'user_id',
+    'status',
+    'start_time',
+    'end_time'
+}
+
 # Define comparison operators
 comparison_ops = oneOf("= != > >= < <= eq ne gt ge lt le", caseless=True)
 
@@ -41,9 +51,15 @@ string = quotedString.setParseAction(removeQuotes)
 # Define value (number or string)
 value = number | string
 
+# Define field, which can be either field_type.identifier or just identifier
+field = (
+    Group(field_type + Literal('.').suppress() + identifier)('field_nested') |
+    identifier('field_top')
+)
+
 # Define comparison expression
 comparison_expr = Group(
-    (field_type + Literal('.').suppress() + identifier)('field') +
+    field +
     comparison_ops('op') +
     value('value')
 )
@@ -66,85 +82,119 @@ def parse_filter_expression(filter_expr):
         raise ValueError(f"Error parsing filter expression: {e}")
 
 def comparison_to_query(tokens):
-    field_info = tokens['field']
     operator = tokens['op']
     value = tokens['value']
-
-    # Extract field components
-    field_type = field_info[0].lower()
-    key = field_info[1]
-
-    path = field_type
-    key_field = f"{field_type}.key"
-    value_field = f"{field_type}.value"
-
-    # Map operators to OpenSearch equivalents
-    operator_map = {
-        '=': 'term',
-        'eq': 'term',
-        '!=': 'must_not',
-        'ne': 'must_not',
-        '>': 'gt',
-        'gt': 'gt',
-        '>=': 'gte',
-        'ge': 'gte',
-        '<': 'lt',
-        'lt': 'lt',
-        '<=': 'lte',
-        'le': 'lte'
-    }
-
-    if operator.lower() in ['=', 'eq']:
-        term_query = {
-            "nested": {
-                "path": path,
-                "query": {
-                    "bool": {
-                        "must": [
-                            { "term": { key_field: key } },
-                            { "term": { value_field: value } }
-                        ]
+    
+    # Check if it's a nested field or a top-level field
+    if 'field_nested' in tokens:
+        field_info = tokens['field_nested']
+        field_type = field_info[0].lower()
+        key = field_info[1]
+        
+        path = field_type
+        key_field = f"{field_type}.key"
+        value_field = f"{field_type}.value"
+        
+        # Map operators to OpenSearch equivalents
+        operator_map = {
+            '=': 'term',
+            'eq': 'term',
+            '!=': 'must_not',
+            'ne': 'must_not',
+            '>': 'gt',
+            'gt': 'gt',
+            '>=': 'gte',
+            'ge': 'gte',
+            '<': 'lt',
+            'lt': 'lt',
+            '<=': 'lte',
+            'le': 'lte'
+        }
+        
+        if operator.lower() in ['=', 'eq']:
+            term_query = {
+                "nested": {
+                    "path": path,
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {"term": {key_field: key}},
+                                {"term": {value_field: value}}
+                            ]
+                        }
                     }
                 }
             }
-        }
-        return term_query
-    elif operator.lower() in ['!=', 'ne']:
-        term_query = {
-            "nested": {
-                "path": path,
-                "query": {
-                    "bool": {
-                        "must": [
-                            { "term": { key_field: key } },
-                            { "term": { value_field: value } }
-                        ]
+            return term_query
+        elif operator.lower() in ['!=', 'ne']:
+            term_query = {
+                "nested": {
+                    "path": path,
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {"term": {key_field: key}},
+                                {"term": {value_field: value}}
+                            ]
+                        }
                     }
                 }
             }
-        }
-        return {
-            "bool": {
-                "must_not": term_query
+            return {"bool": {"must_not": [term_query]}}
+        else:
+            # Range queries
+            range_op = operator_map[operator.lower()]
+            range_query = {
+                "nested": {
+                    "path": path,
+                    "query": {
+                        "bool": {
+                            "filter": [
+                                {"term": {key_field: key}},
+                                {"range": {value_field: {range_op: value}}}
+                            ]
+                        }
+                    }
+                }
             }
+            return range_query
+    elif 'field_top' in tokens:
+        # Handle top-level fields
+        field_name = tokens['field_top']
+        
+        # Validate the top-level field
+        if field_name not in VALID_TOP_LEVEL_FIELDS:
+            raise ValueError(f"Invalid top-level field in filter expression: '{field_name}'")
+        
+        # Map operators to OpenSearch equivalents
+        operator_map = {
+            '=': 'term',
+            'eq': 'term',
+            '!=': 'must_not',
+            'ne': 'must_not',
+            '>': 'gt',
+            'gt': 'gt',
+            '>=': 'gte',
+            'ge': 'gte',
+            '<': 'lt',
+            'lt': 'lt',
+            '<=': 'lte',
+            'le': 'lte'
         }
+        
+        if operator.lower() in ['=', 'eq']:
+            term_query = {"term": {field_name: value}}
+            return term_query
+        elif operator.lower() in ['!=', 'ne']:
+            term_query = {"term": {field_name: value}}
+            return {"bool": {"must_not": [term_query]}}
+        else:
+            # Range queries
+            range_op = operator_map[operator.lower()]
+            range_query = {"range": {field_name: {range_op: value}}}
+            return range_query
     else:
-        # Range queries
-        range_op = operator_map[operator.lower()]
-        range_query = {
-            "nested": {
-                "path": path,
-                "query": {
-                    "bool": {
-                        "must": [
-                            { "term": { key_field: key } },
-                            { "range": { value_field: { range_op: value } } }
-                        ]
-                    }
-                }
-            }
-        }
-        return range_query
+        raise ValueError("Invalid field in filter expression.")
 
 def ast_to_query(ast):
     if isinstance(ast, str):
@@ -169,7 +219,7 @@ def ast_to_query(ast):
             if op.lower() == 'and':
                 return {
                     "bool": {
-                        "must": [
+                        "filter": [
                             ast_to_query(left),
                             ast_to_query(right)
                         ]
@@ -206,26 +256,42 @@ def build_sort(order_by):
             raise ValueError(f"Invalid sort direction in clause: '{clause}'")
         
         field_info = field.split('.')
-        if len(field_info) != 2:
-            raise ValueError(f"Invalid field in order_by clause: '{clause}'")
-        field_type, key = field_info
-        field_type = field_type.lower()
-        path = field_type
-        key_field = f"{field_type}.key"
-        value_field = f"{field_type}.value"
-
-        sort_clause = {
-            value_field: {
-                "order": direction.lower(),
-                "nested": {
-                    "path": path,
-                    "filter": {
-                        "term": { key_field: key }
+        if len(field_info) == 2:
+            # Nested field (e.g., 'metrics.accuracy')
+            field_type, key = field_info
+            field_type = field_type.lower()
+            path = field_type
+            key_field = f"{field_type}.key"
+            value_field = f"{field_type}.value"
+    
+            sort_clause = {
+                value_field: {
+                    "order": direction.lower(),
+                    "nested": {
+                        "path": path,
+                        "filter": {
+                            "term": {key_field: key}
+                        }
                     }
                 }
             }
-        }
-        sort_list.append(sort_clause)
+            sort_list.append(sort_clause)
+        elif len(field_info) == 1:
+            # Top-level field (e.g., 'start_time')
+            field_name = field_info[0]
+            
+            # Validate the top-level field
+            if field_name not in VALID_TOP_LEVEL_FIELDS:
+                raise ValueError(f"Invalid top-level field in order_by clause: '{field_name}'")
+            
+            sort_clause = {
+                field_name: {
+                    "order": direction.lower()
+                }
+            }
+            sort_list.append(sort_clause)
+        else:
+            raise ValueError(f"Invalid field in order_by clause: '{clause}'")
     return sort_list
 
 def search_runs(request_body):
@@ -241,13 +307,13 @@ def search_runs(request_body):
         "size": max_results,
         "query": {
             "bool": {
-                "must": []
+                "filter": []
             }
         }
     }
     
     # Add experiment_id to the query
-    query_body['query']['bool']['must'].append({
+    query_body['query']['bool']['filter'].append({
         "term": {
             "experiment_id": experiment_id
         }
@@ -257,7 +323,7 @@ def search_runs(request_body):
     if filter_expr:
         parsed_filter = parse_filter_expression(filter_expr)
         filter_query = ast_to_query(parsed_filter)
-        query_body['query']['bool']['must'].append(filter_query)
+        query_body['query']['bool']['filter'].append(filter_query)
     
     # Add sorting to query
     if order_by:
@@ -296,12 +362,13 @@ def search_runs(request_body):
 if __name__ == "__main__":
     request_body = {
         "experiment_id": "exp1",
-        "filter": "metrics.accuracy > 0.9",
+        "filter": "status = 'FINISHED' and metrics.accuracy > 0.9",
         "max_results": 100,
         "order_by": ["metrics.accuracy DESC"]
     }
-    result = search_runs(request_body)
-    print(json.dumps(result, indent=2))
-    
-
-    
+    try:
+        result = search_runs(request_body)
+        print(json.dumps(result, indent=2))
+    except ValueError as e:
+        print(f"Validation Error: {e}")
+        
