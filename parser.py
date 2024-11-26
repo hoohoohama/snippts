@@ -42,8 +42,8 @@ field_type = oneOf("metrics params tags attributes", caseless=True)
 # Define identifier (e.g., 'accuracy', 'optimizer')
 identifier = Word(alphas + "_", alphanums + "_.:")
 
-# Define numeric value
-number = Regex(r'\d+(\.\d*)?([eE][+-]?\d+)?').setParseAction(lambda t: float(t[0]))
+# Define numeric value (as string)
+number = Regex(r'\d+(\.\d*)?([eE][+-]?\d+)?')
 
 # Define string value
 string = quotedString.setParseAction(removeQuotes)
@@ -57,8 +57,8 @@ field = (
     identifier('field_top')
 )
 
-# Define comparison expression
-comparison_expr = Group(
+# Define comparison expression (removed Group)
+comparison_expr = (
     field +
     comparison_ops('op') +
     value('value')
@@ -82,18 +82,17 @@ def parse_filter_expression(filter_expr):
         raise ValueError(f"Error parsing filter expression: {e}")
 
 def comparison_to_query(tokens):
-    operator = tokens['op']
-    value = tokens['value']
-    
+    operator = tokens.op
+    value = tokens.value[0]  # Extract the string value
+
     # Check if it's a nested field or a top-level field
     if 'field_nested' in tokens:
-        field_info = tokens['field_nested']
+        field_info = tokens.field_nested
         field_type = field_info[0].lower()
         key = field_info[1]
         
         path = field_type
         key_field = f"{field_type}.key"
-        value_field = f"{field_type}.value"
         
         # Map operators to OpenSearch equivalents
         operator_map = {
@@ -111,7 +110,12 @@ def comparison_to_query(tokens):
             'le': 'lte'
         }
         
-        if operator.lower() in ['=', 'eq']:
+        range_operators = {'>', 'gt', '>=', 'ge', '<', 'lt', '<=', 'le'}
+        equality_operators = {'=', 'eq', '!=', 'ne'}
+        
+        if operator.lower() in equality_operators:
+            value_field = f"{field_type}.value"
+            
             term_query = {
                 "nested": {
                     "path": path,
@@ -125,25 +129,22 @@ def comparison_to_query(tokens):
                     }
                 }
             }
-            return term_query
-        elif operator.lower() in ['!=', 'ne']:
-            term_query = {
-                "nested": {
-                    "path": path,
-                    "query": {
-                        "bool": {
-                            "filter": [
-                                {"term": {key_field: key}},
-                                {"term": {value_field: value}}
-                            ]
-                        }
-                    }
-                }
-            }
-            return {"bool": {"must_not": [term_query]}}
-        else:
-            # Range queries
+            
+            if operator.lower() in ['!=', 'ne']:
+                return {"bool": {"must_not": [term_query]}}
+            else:
+                return term_query
+        
+        elif operator.lower() in range_operators:
+            # Attempt to parse value as float
+            try:
+                numeric_value = float(value)
+            except ValueError:
+                raise ValueError(f"Range operator '{operator}' requires a numeric value for field '{field_type}.{key}'.")
+            
+            value_field = f"{field_type}.value.double"
             range_op = operator_map[operator.lower()]
+            
             range_query = {
                 "nested": {
                     "path": path,
@@ -151,16 +152,19 @@ def comparison_to_query(tokens):
                         "bool": {
                             "filter": [
                                 {"term": {key_field: key}},
-                                {"range": {value_field: {range_op: value}}}
+                                {"range": {value_field: {range_op: numeric_value}}}
                             ]
                         }
                     }
                 }
             }
             return range_query
+        else:
+            raise ValueError(f"Unsupported operator '{operator}'.")
+    
     elif 'field_top' in tokens:
-        # Handle top-level fields
-        field_name = tokens['field_top']
+        # Handle top-level fields as before
+        field_name = tokens.field_top
         
         # Validate the top-level field
         if field_name not in VALID_TOP_LEVEL_FIELDS:
@@ -182,17 +186,27 @@ def comparison_to_query(tokens):
             'le': 'lte'
         }
         
-        if operator.lower() in ['=', 'eq']:
+        range_operators = {'>', 'gt', '>=', 'ge', '<', 'lt', '<=', 'le'}
+        equality_operators = {'=', 'eq', '!=', 'ne'}
+        
+        if operator.lower() in equality_operators:
             term_query = {"term": {field_name: value}}
-            return term_query
-        elif operator.lower() in ['!=', 'ne']:
-            term_query = {"term": {field_name: value}}
-            return {"bool": {"must_not": [term_query]}}
-        else:
-            # Range queries
+            if operator.lower() in ['!=', 'ne']:
+                return {"bool": {"must_not": [term_query]}}
+            else:
+                return term_query
+        elif operator.lower() in range_operators:
+            # Attempt to parse value as float
+            try:
+                numeric_value = float(value)
+            except ValueError:
+                raise ValueError(f"Range operator '{operator}' requires a numeric value for field '{field_name}'.")
+            
             range_op = operator_map[operator.lower()]
-            range_query = {"range": {field_name: {range_op: value}}}
+            range_query = {"range": {field_name: {range_op: numeric_value}}}
             return range_query
+        else:
+            raise ValueError(f"Unsupported operator '{operator}'.")
     else:
         raise ValueError("Invalid field in filter expression.")
 
@@ -362,13 +376,14 @@ def search_runs(request_body):
 if __name__ == "__main__":
     request_body = {
         "experiment_id": "exp1",
-        "filter": "status = 'FINISHED' and metrics.accuracy > 0.9",
+        "filter": "params.learning_rate >= 0.01 and params.optimizer = 'adam'",
         "max_results": 100,
-        "order_by": ["metrics.accuracy DESC"]
+        "order_by": ["params.learning_rate DESC"]
     }
     try:
         result = search_runs(request_body)
         print(json.dumps(result, indent=2))
     except ValueError as e:
         print(f"Validation Error: {e}")
+        
         
