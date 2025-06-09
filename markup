@@ -1,0 +1,48 @@
+# 🌙 User Guide: Cost-Efficient Real-Time Inference with a Single SageMaker Inference Component
+
+## 1. 🧠 Introduction and Use Cases
+
+### ✅ What is an Inference Component?
+
+An **Inference Component (IC)** in Amazon SageMaker allows modular, isolated model execution within a real-time endpoint. It supports:
+
+- **Auto-scaling to zero**: No charges when idle  
+- **Per-model compute control**: Assign CPU, memory, and GPU  
+- **Cost-efficient hosting**: Ideal for sporadic workloads
+
+### 🔍 When to Use a Single Inference Component
+
+| Use Case | Why IC is Ideal |
+|----------|-----------------|
+| LLMs and large models | Scale to zero when idle |
+| Spiky or seasonal traffic | Cold-start only when needed |
+| Single-model endpoints | No routing or variants |
+| GPU-backed workloads | Dedicated GPU per model |
+| Pay-as-you-go ML APIs | Avoid idle instance costs |
+
+---
+
+## 2. ⚙️ Configuration Parameters
+
+### ✅ Prerequisites
+
+- Model artifact in S3 (e.g., `s3://your-bucket/model.tar.gz`)
+- Container image URI (SageMaker-provided or ECR)
+- IAM execution role
+- Python 3.8+ with `boto3` installed
+
+### 🔨 Model Registration
+
+```python
+import boto3
+
+sm = boto3.client('sagemaker')
+
+sm.create_model(
+    ModelName='my-model',
+    PrimaryContainer={
+        'Image': '<container-image-uri>',
+        'ModelDataUrl': 's3://your-bucket/model.tar.gz'
+    },
+    ExecutionRoleArn='<sagemaker-execution-role>'
+)
