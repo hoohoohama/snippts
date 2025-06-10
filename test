@@ -1,0 +1,175 @@
+
+# 🌙 User Guide: Cost-Efficient Real-Time Inference with a Single SageMaker Inference Component
+
+## 1. 🧠 Introduction and Use Cases
+
+### ✅ What is an Inference Component?
+
+An **Inference Component (IC)** in Amazon SageMaker allows modular, isolated model execution within a real-time endpoint. It supports:
+
+- **Auto-scaling to zero**: No charges when idle  
+- **Per-model compute control**: Assign CPU, memory, and GPU  
+- **Cost-efficient hosting**: Ideal for sporadic workloads
+
+### 🔍 When to Use a Single Inference Component
+
+| Use Case                 | Why IC is Ideal                    |
+|--------------------------|------------------------------------|
+| LLMs and large models     | Scale to zero when idle            |
+| Spiky or seasonal traffic | Cold-start only when needed        |
+| Single-model endpoints    | No routing or variants             |
+| GPU-backed workloads      | Dedicated GPU per model            |
+| Pay-as-you-go ML APIs     | Avoid idle instance costs          |
+
+---
+
+## 2. ⚙️ Configuration Parameters
+
+### ✅ Prerequisites
+
+- Model artifact in S3 (e.g., `s3://your-bucket/model.tar.gz`)
+- Container image URI (SageMaker-provided or custom in ECR)
+- IAM execution role with SageMaker permissions
+- Python 3.8+ with `boto3` installed
+
+### 🔨 Model Registration
+
+```python
+import boto3
+
+sm = boto3.client('sagemaker')
+
+sm.create_model(
+    ModelName='my-model',
+    PrimaryContainer={
+        'Image': '<container-image-uri>',
+        'ModelDataUrl': 's3://your-bucket/model.tar.gz'
+    },
+    ExecutionRoleArn='<sagemaker-execution-role>'
+)
+```
+
+### 🧩 Inference Component Creation
+
+```python
+sm.create_inference_component(
+    InferenceComponentName='my-endpoint',
+    EndpointName='my-endpoint',
+    ModelName='my-model',
+    VariantName='AllTraffic',
+    ComputeResourceRequirements={
+        'MinMemoryRequiredInMb': 4096,
+        'NumberOfCpuCoresRequired': 1
+    }
+)
+```
+
+> **Note:** This creates the endpoint automatically. No need for an endpoint config.
+
+### ⚙️ Optional Compute Parameters
+
+| Parameter                          | Description                                 |
+|-----------------------------------|---------------------------------------------|
+| `MinMemoryRequiredInMb`           | Required memory in MB (e.g., 4096)          |
+| `NumberOfCpuCoresRequired`        | Optional vCPUs (e.g., 0.5 or 1)              |
+| `NumberOfAcceleratorDevicesRequired` | Optional GPU setting (e.g., `1`)        |
+| `MinDiskSizeInMb`                 | Optional disk space in MB                   |
+
+### 📈 Auto Scaling with Scale-to-Zero
+
+```python
+import boto3
+
+autoscaling = boto3.client('application-autoscaling')
+
+autoscaling.register_scalable_target(
+    ServiceNamespace='sagemaker',
+    ResourceId='inference-component/my-endpoint/my-endpoint',
+    ScalableDimension='sagemaker:inference-component:DesiredCopyCount',
+    MinCapacity=0,
+    MaxCapacity=5
+)
+
+autoscaling.put_scaling_policy(
+    PolicyName='scale-to-zero',
+    ServiceNamespace='sagemaker',
+    ResourceId='inference-component/my-endpoint/my-endpoint',
+    ScalableDimension='sagemaker:inference-component:DesiredCopyCount',
+    PolicyType='TargetTrackingScaling',
+    TargetTrackingScalingPolicyConfiguration={
+        'TargetValue': 4.0,
+        'PredefinedMetricSpecification': {
+            'PredefinedMetricType': 'SageMakerInferenceComponentConcurrentInvocationsPerCopy'
+        },
+        'ScaleInCooldown': 300,
+        'ScaleOutCooldown': 60
+    }
+)
+```
+
+---
+
+## 3. 🚀 How to Invoke
+
+### ✅ Invoke Using `boto3`
+
+```python
+import boto3
+
+runtime = boto3.client('sagemaker-runtime')
+
+response = runtime.invoke_endpoint(
+    EndpointName='my-endpoint',
+    ContentType='application/json',
+    Body=b'{"inputs": "hello"}'
+)
+
+print(response['Body'].read().decode('utf-8'))
+```
+
+### 🧾 Optional Header (for REST clients)
+
+You may include this header if required by proxy:
+
+```
+x-amzn-sagemaker-inference-component-name: my-endpoint
+```
+
+---
+
+## 4. ❗ Handling Errors
+
+### 🧊 Cold Start Behavior
+
+When `DesiredCopyCount = 0`, SageMaker terminates the IC's backing instance. Upon next request:
+
+| Event              | Result                                           |
+|--------------------|--------------------------------------------------|
+| Request received   | Triggers cold start (infra + container + model) |
+| Latency            | ~20–90 seconds                                   |
+| Response           | Eventually returns successfully                  |
+| Reuse              | Subsequent calls are fast (IC is warm)           |
+
+### 🔍 Monitor Metrics
+
+| Metric                         | Purpose                                 |
+|-------------------------------|-----------------------------------------|
+| `DesiredCopyCount = 0`        | IC has scaled to zero                   |
+| `NoCapacityInvocationFailures`| Request arrived during cold start       |
+| CloudWatch Logs               | Show startup and model load time        |
+
+> 💡 Tip: Set `MinCapacity=1` to keep the IC warm during peak hours.
+
+---
+
+## 5. ⚠️ Limitations
+
+| Constraint                                 | Description                                                      |
+|--------------------------------------------|------------------------------------------------------------------|
+| ❌ Cannot upgrade non-IC endpoint           | Must delete and recreate endpoint to use Inference Components   |
+| ❌ Cannot remove IC once attached           | Endpoint stays IC-based once created                            |
+| 🚫 No multi-model routing in this setup     | Single IC only (no variant traffic splitting)                   |
+| ⏱ Cold start latency                       | 20–90 seconds when scaled to zero                               |
+| 🛠 IC name should match endpoint name       | Simplifies management and invocation                            |
+
+---
