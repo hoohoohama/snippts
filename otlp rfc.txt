@@ -1,0 +1,429 @@
+Got it — here’s a Confluence-ready version of your RFC.
+
+I’ve formatted it using:
+	•	Confluence headings (h1., h2.)
+	•	{code} blocks for diagrams/code
+	•	clean tables
+	•	readable sections (good for copy/paste)
+
+⸻
+
+📄 OTLP Ingestion Service for MLflow-Compatible Tracing
+
+⸻
+
+h1. Overview
+
+This RFC proposes a write-only OTLP ingestion service to support tracing for agentic and GenAI applications.
+
+The service will:
+	•	Accept traces via OpenTelemetry OTLP/HTTP (/v1/traces)
+	•	Authenticate requests using JWT tokens
+	•	Authorize access using server-side project mapping
+	•	Accept MLflow experiment routing via:
+	•	x-mlflow-experiment-id
+	•	Normalize and convert spans into MLflow-compatible trace format
+	•	Persist:
+	•	Full trace JSON in S3 (source of truth)
+	•	Trace metadata and spans in DynamoDB (index)
+	•	Enable downstream indexing via:
+	•	DynamoDB Streams → OpenSearch
+
+The service is deployed in two regions behind a single endpoint and enforces a strict write-only access model.
+
+⸻
+
+h1. Value Proposition
+	•	Observability for agentic systems
+	•	MLflow-compatible tracing
+	•	Decoupled ingestion architecture
+	•	Strong access control model
+	•	Scalable design with phased evolution
+
+⸻
+
+h1. Goals
+
+h2. Functional
+	•	OTLP ingestion
+	•	JWT authentication
+	•	Project authorization
+	•	MLflow experiment routing
+	•	S3 + DynamoDB persistence
+
+h2. Non-functional
+	•	Correctness
+	•	Scalability
+	•	Observability
+	•	Strict access isolation
+
+⸻
+
+h1. Non-Goals
+	•	MLflow server replacement
+	•	Advanced rate limiting (v1)
+	•	Multi-region S3 replication (v1)
+	•	Async ingestion in v1
+
+⸻
+
+h1. Design
+
+⸻
+
+h2. Architecture Overview
+
+The system separates:
+	•	Ingestion (write-only ECS service)
+	•	Persistence (sync in v1, async in v2)
+
+⸻
+
+h2. Access Model
+
+Producer Role
+
+A Producer is any client sending traces.
+
+|| Capability || Allowed ||
+| Write traces | ✅ |
+| Write spans/events/logs | ✅ |
+| Read data | ❌ |
+| Query data | ❌ |
+| List data | ❌ |
+
+This enforces a strict separation between write path and read/query systems.
+
+⸻
+
+h2. Phase 1 Architecture (Initial Release)
+
+{code}
+Clients (Producers)
+|
+v
+Ingestion Service (ECS)
+|
+├── S3 (trace JSON)
+└── DynamoDB (index)
+|
+v
+OpenSearch
+{code}
+
+⸻
+
+h2. Target Architecture (Phase 2)
+
+{code}
+Clients
+|
+v
+Ingestion Service (ECS)
+|
+v
+SQS Queue
+|
+v
+Workers (Lambda or ECS)
+|
+├── S3
+└── DynamoDB
+|
+v
+OpenSearch
+{code}
+
+⸻
+
+h2. Request Flow
+
+{code}
+Client
+|
+| POST /v1/traces
+v
+Ingestion Service
+|
+| 1. Validate JWT
+| 2. Authorize project
+| 3. Decode OTLP
+| 4. Normalize spans
+|
+| Phase 1: persist
+| Phase 2: enqueue
+|
+v
+Response
+{code}
+
+⸻
+
+h2. API
+
+Endpoint
+
+{code}
+POST /v1/traces
+{code}
+
+Headers
+
+{code}
+Authorization: Bearer 
+x-project-name: 
+x-mlflow-experiment-id: <experiment_id>
+{code}
+
+Content-Type
+
+{code}
+application/x-protobuf
+{code}
+
+⸻
+
+h2. Authentication & Authorization
+
+{code}
+subject = token.sub
+project = x-project-name
+
+is_allowed(subject, project)
+{code}
+
+⸻
+
+h2. Data Model
+
+S3 (Source of Truth)
+
+{code}
+projects//traces/<trace_id>.json
+{code}
+
+DynamoDB (Index)
+
+{code}
+pk = TRACE##<trace_id>
+sk = TRACEINFO | SPAN#<span_id>
+{code}
+
+⸻
+
+h2. MLflow Compatibility
+
+To ensure compatibility with MLflow clients:
+	•	Use MLflow entities (Trace, Span)
+	•	Serialize using:
+{code}
+Trace.to_json()
+{code}
+	•	Validate using:
+{code}
+Trace.from_json(trace_json)
+{code}
+	•	Pin MLflow version
+	•	Maintain golden trace test suite
+
+⸻
+
+h2. Multi-Region Architecture
+
+Routing
+
+{code}
+User
+|
+v
+Global Endpoint
+|
++–> Region A
++–> Region B
+{code}
+	•	Each request is handled by one region
+	•	That region becomes the writer region
+
+⸻
+
+h2. Multi-Region Storage and Networking
+
+Write Model
+	•	Single endpoint
+	•	Single writer region per trace
+
+⸻
+
+DynamoDB
+	•	Uses Global Tables
+	•	Provides global metadata availability
+
+Metadata fields:
+
+{code}
+writer_region
+trace_json_s3_bucket
+trace_json_s3_key
+trace_json_s3_region
+{code}
+
+⸻
+
+S3
+	•	Region-local writes preferred
+	•	Avoid cross-region dependencies
+	•	Lower latency and simpler operations
+
+⸻
+
+Networking
+	•	ECS runs inside VPC
+	•	Region-local S3 access preferred
+	•	No cross-region S3 dependency in v1
+
+⸻
+
+Read Model
+	•	DynamoDB → global metadata
+	•	S3 → canonical trace payload
+	•	Readers must use stored S3 location metadata
+
+⸻
+
+h2. Scalability
+
+{code}
+Ingress (ECS)  → scales on request rate
+Queue (future) → buffers bursts
+Workers        → scale on backlog
+{code}
+
+Worker Scaling Signals (Phase 2)
+	•	Queue depth
+	•	Oldest message age
+
+⸻
+
+h2. Deployment
+	•	ECS services (shared cluster)
+	•	ALB ingress
+	•	No API Gateway (v1)
+
+⸻
+
+h1. Sample Producer Integration (Google ADK)
+
+Google ADK agents integrate using OpenTelemetry.
+
+⸻
+
+h2. Example: ADK Agent
+
+{code:python}
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+JWT_TOKEN = “”
+PROJECT = “project-a”
+EXPERIMENT_ID = “123”
+
+exporter = OTLPSpanExporter(
+endpoint=“https://otlp.example.internal/v1/traces”,
+headers={
+“Authorization”: f”Bearer {JWT_TOKEN}”,
+“x-project-name”: PROJECT,
+“x-mlflow-experiment-id”: EXPERIMENT_ID,
+},
+)
+
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(exporter))
+trace.set_tracer_provider(provider)
+
+from google.adk.agents import LlmAgent
+from google.adk.tools import FunctionTool
+
+def add(a, b):
+return str(a + b)
+
+tool = FunctionTool(func=add)
+
+agent = LlmAgent(
+name=“MathAgent”,
+model=“gemini-2.0-flash-exp”,
+tools=[tool],
+)
+{code}
+
+⸻
+
+h2. Run
+
+{code}
+adk run my_agent
+{code}
+
+⸻
+
+h2. Notes
+	•	Tracing must be configured before agent initialization
+	•	Producers are write-only
+	•	No read permissions required
+
+⸻
+
+h1. Timelines
+
+Phase 1
+	•	Synchronous ingestion
+	•	ECS deployment
+
+Phase 2
+	•	SQS + workers
+	•	Async persistence
+
+Phase 3
+	•	Rate limiting
+	•	Optimization
+
+⸻
+
+h1. Risks
+
+|| Risk || Mitigation ||
+| Burst traffic | Queue (Phase 2) |
+| Large payloads | Payload limits |
+| Duplicate writes | Idempotency |
+| Unauthorized access | Write-only model |
+| MLflow mismatch | Round-trip validation |
+
+⸻
+
+h1. Alternatives
+	•	MLflow direct ingestion → rejected
+	•	OpenSearch-only → rejected
+	•	API Gateway → deferred
+
+⸻
+
+h1. References
+	•	OpenTelemetry OTLP
+	•	MLflow tracing
+	•	AWS ECS / S3 / DynamoDB
+
+⸻
+
+🔥 Final Takeaway
+
+Producers can only write — never read.
+S3 is the source of truth.
+DynamoDB is the index.
+Each trace has a single writer region.
+
+⸻
+
+If you want next, I can:
+	•	convert this into a Confluence template (with macros, callouts, expand sections)
+	•	or make a version tailored for exec review vs engineering review
